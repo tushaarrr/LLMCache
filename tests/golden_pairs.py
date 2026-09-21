@@ -253,3 +253,69 @@ if __name__ == "__main__":
         sweep(default_embedder())
     except ImportError:
         print("\nInstall sentence-transformers to run the threshold sweep.")
+
+
+# ---------------------------------------------------------------------------
+# Rerank calibration. Split deterministically so a threshold picked on one half
+# can be reported honestly on the other -- tuning on all 66 pairs and then
+# quoting "0 false hits on 66 pairs" is circular.
+# ---------------------------------------------------------------------------
+
+def split(pairs):
+    """(calibration, holdout) -- even indices tune, odd indices report."""
+    return pairs[0::2], pairs[1::2]
+
+
+def rerank_sweep(reranker, thresholds=None, label=""):
+    """Score every pair with the cross-encoder and report both halves."""
+    if thresholds is None:
+        thresholds = [i / 2 for i in range(-24, 25)]
+
+    def score(p):
+        # Orientation matters: cross-encoders are not symmetric, and the cache
+        # calls reranker(query, [stored_question]). `a` is what was put, `b` is
+        # what is asked, so this must be (b, [a]) -- scoring (a, [b]) calibrates
+        # a threshold the running cache never uses.
+        return float(reranker(p.b, [p.a])[0])
+
+    hit_c, hit_h = split(MUST_HIT)
+    miss_c, miss_h = split(MUST_MISS)
+    scored = {
+        "cal": ([(p, score(p)) for p in hit_c], [(p, score(p)) for p in miss_c]),
+        "holdout": ([(p, score(p)) for p in hit_h], [(p, score(p)) for p in miss_h]),
+    }
+
+    def at(half, t):
+        hits, misses = scored[half]
+        recall = sum(1 for _, s in hits if s >= t) / len(hits)
+        false = [(p, s) for p, s in misses if s >= t]
+        return recall, false
+
+    # Pick on the CALIBRATION half only: lowest threshold with zero false hits.
+    best = None
+    for t in thresholds:
+        recall, false = at("cal", t)
+        if not false and (best is None or recall > best[1]):
+            best = (t, recall)
+
+    print(f"\n=== rerank sweep {label} ===")
+    print(f"{'thresh':>7} {'cal recall':>11} {'cal false':>10} "
+          f"{'hold recall':>12} {'hold false':>11}")
+    step = max(1, len(thresholds) // 16)
+    for t in thresholds[::step]:
+        rc, fc = at("cal", t)
+        rh, fh = at("holdout", t)
+        print(f"{t:>7.1f} {rc:>10.0%} {len(fc):>10} {rh:>11.0%} {len(fh):>11}")
+
+    if best is None:
+        print("\nNo threshold gives zero false hits on the calibration half.")
+        return None, scored
+    t, cal_recall = best
+    hold_recall, hold_false = at("holdout", t)
+    print(f"\nChosen on calibration half: threshold {t:.1f} "
+          f"(cal recall {cal_recall:.0%})")
+    print(f"HOLDOUT at {t:.1f}: recall {hold_recall:.0%}, "
+          f"false hits {len(hold_false)}")
+    for p, s in sorted(hold_false, key=lambda x: -x[1]):
+        print(f"    SURVIVING FALSE HIT {s:+.2f} [{p.why}] {p.a!r} / {p.b!r}")
+    return t, scored

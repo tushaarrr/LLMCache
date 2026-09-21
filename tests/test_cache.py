@@ -181,8 +181,8 @@ def test_embedder_is_a_plain_callable():
 
     c = Cache(":memory:", embedder=embed, dim=DIM)
     c.put("q", "a")
-    assert c.get("q") == "a"
-    assert calls == ["q", "q"]
+    assert c.get("unrelated") is None    # different prompt: reaches the embedder
+    assert calls == ["q", "unrelated"]
     c.close()
 
 
@@ -295,7 +295,7 @@ def test_nan_score_is_rejected_by_the_accept_test(cache, monkeypatch):
     row_id = cache.put("q", "a")
     monkeypatch.setattr(cache._store, "search",
                         lambda *_a, **_k: [(float("nan"), row_id)])
-    assert cache.get("q") is None
+    assert cache.get("different prompt") is None   # must miss L0 to reach search
 
 
 def test_tenant_is_not_starved_out_of_its_own_entry():

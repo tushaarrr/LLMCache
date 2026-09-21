@@ -78,8 +78,44 @@ always rebuildable from the scalar store.
 
 - `get(prompt, threshold=None, session_id=None, max_age=None) -> str | None`
 - `put(prompt, answer, session_id=None) -> int | None`
+- `aget(...)` / `aput(...)` — same semantics, off the event loop
 - `search(prompt, top_k=None, session_id=None, max_age=None) -> list[(score, question, answer)]` — unfiltered by threshold; the calibration tool
 - `close()` — also runs on `__exit__`
+
+Async runs the sync body in `asyncio.to_thread`. If the embedder is itself a
+coroutine function it is awaited on the loop instead of blocking a worker.
+
+## Expiry
+
+Nothing expires unless you ask. `max_age` is in seconds, per-call or per-cache:
+
+```python
+cache = Cache("cache.db", max_age=86_400)   # sweep reclaims disk
+cache.get("what is the latest python version", max_age=3600)   # hides only
+```
+
+Expiry is applied before the top-k cut, so a stale entry cannot occupy a
+candidate slot. Only the instance-level `max_age` marks rows for compaction; a
+per-call value hides them without reclaiming the file.
+
+## Shadow mode
+
+Measure before you trust. `shadow=True` never serves and records what it would
+have served, one JSON line per query:
+
+```python
+cache = Cache("cache.db", shadow=True, shadow_log="shadow.jsonl")
+...
+from semcache import shadow_report
+shadow_report("shadow.jsonl")   # hit rate, score distribution, top 20
+```
+
+## Exact repeats
+
+An exact repeat (case- and whitespace-insensitive) resolves from a bounded dict
+without touching the embedder, which is 70–85% of a hit. It still goes through
+the same row lookup, so sessions, expiry and eviction all apply — the L0 layer
+holds row ids, never answers.
 
 ## Calibrate the threshold on your own traffic
 
@@ -112,6 +148,48 @@ ID_PATTERN = re.compile(r"\b([A-Z]{2,}-\d+|\d{3,}|v?\d+\.\d+)\b")
 
 It neutralizes 7 of 31 adversarial pairs for 1 of 29 legitimate hits lost. Pass
 `skip_pattern=None` to disable.
+
+### Reranking cuts the rest roughly in half
+
+A bi-encoder scores each sentence alone and never sees the pair. A cross-encoder
+reads both together, which is what direction and negation need:
+
+```python
+from semcache import Cache, cross_encoder_reranker
+
+cache = Cache("cache.db",
+              reranker=cross_encoder_reranker(),   # quora-distilroberta
+              rerank_threshold=0.0322)             # NOT on the cosine scale
+```
+
+Measured on a held-out half of the labelled set, with the threshold chosen on
+the other half only:
+
+| | recall | false hits |
+|---|---|---|
+| cosine ≥ 0.68 | 93% | 12/13 |
+| rerank ≥ 0.0322 | 93% | **7/13** |
+
+Same recall, roughly half the wrong answers — **and still not zero.** Three of
+the survivors score 0.96+, so no threshold reaches zero at any usable recall.
+Treat reranking as a large improvement, not a guarantee.
+
+### Verify-on-hit
+
+For the uncertain middle, hand the pair to a small model:
+
+```python
+cache = Cache("cache.db", verifier=my_llm_check, verify_band=(0.60, 0.85))
+```
+
+Above the band the score speaks for itself; below it the answer is a miss
+anyway; only the band pays for a call. It fails **closed** — a verifier that
+raises is a miss. `cache.band_rate()` reports what fraction actually paid.
+
+Note the caveat that the measurement exposes: on this dataset the worst false
+hits score 0.96+, i.e. *above* a default band, so catching them needs an upper
+bound near 1.0 and therefore verifying nearly every hit. That is a cost
+decision, not a default.
 
 ## Sessions
 
@@ -147,22 +225,45 @@ Embedding dominates below ~100k entries (10–30 ms per short prompt on CPU), so
 profile the embedder before optimizing the search. Past ~200k entries, replace
 the body of `Store.search` with faiss or hnswlib; the signature does not change.
 
+## HTTP server
+
+In-process, gunicorn with 4 workers is 4 disjoint caches and roughly 4× the miss
+rate. One process owning the cache is the fix:
+
+```bash
+pip install fastapi uvicorn requests        # optional; the library never needs them
+python -m semcache.server --db cache.db --port 8000
+```
+
+```python
+from semcache.client import Client
+cache = Client("http://localhost:8000")     # same get/put signatures as Cache
+```
+
+Routes: `POST /get`, `POST /put`, `GET /health`.
+
 ## Tests
 
 ```bash
-pytest tests/ -q             # 98 unit + invariant tests
+pytest tests/ -q             # 150 unit, invariant and integration tests
 pytest tests/ -q -m slow     # + performance budgets and the real embedder
 python -m tests.golden_pairs # threshold calibration sweep
 ```
 
-The suite is mutation-verified: 12 deliberately injected defects, 12 caught.
+The suite is mutation-verified: 30 deliberately injected defects, 30 caught.
 
 ## Limits
 
+- **Semantic hits are never provably safe.** Even with reranking, ~7 of 13
+  adversarial holdout pairs still hit. Run `shadow=True` against your own
+  traffic before trusting it in a request path.
 - **Nothing expires unless you set `max_age`.** Cached facts are served forever.
-- **Single writer.** One lock, one sqlite connection — not built for multi-process writes.
+- **Single writer.** One lock, one sqlite connection. The HTTP server serializes
+  on writes — fine to a few hundred req/s.
 - **Brute-force search.** O(n) scan, fine to ~200k entries.
 - **Capacity is shared across tenants.** Isolation holds, but there is no per-tenant floor.
+- **Long-context prompts are not special-cased.** Two questions over the same
+  large document score ~0.99 and will collide.
 
 ## License
 
