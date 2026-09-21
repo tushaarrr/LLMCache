@@ -1,0 +1,169 @@
+# semcache
+
+A semantic cache for LLM responses. Ask a question that *means* the same as one
+you already asked, get the stored answer back instead of paying for another API
+call.
+
+```
+"what is github?"          -> MISS -> call the LLM -> store
+"what's GitHub"            -> HIT  (cosine 0.94) -> 0ms, $0
+"how do I cook risotto"    -> MISS -> call the LLM -> store
+```
+
+Three files, ~570 lines, three dependencies. Not an LLM SDK wrapper: you call
+your own model, semcache only decides whether you need to.
+
+## Install
+
+```bash
+pip install numpy cachetools sentence-transformers
+```
+
+`numpy` and `cachetools` are required. `sentence-transformers` is the default
+embedder and the only heavy dependency — swap it for any `str -> ndarray`
+callable and you can drop it. sqlite3 is stdlib. No vector database, no ORM.
+
+## Quickstart
+
+```python
+from semcache import Cache
+
+cache = Cache("cache.db")                    # or ":memory:"
+
+answer = cache.get("what is github?")
+if answer is None:
+    answer = my_llm("what is github?")       # your call, your SDK, your retries
+    cache.put("what is github?", answer)
+
+print(cache.get("what's GitHub"))            # hits the row above
+```
+
+Wrap it once and forget it:
+
+```python
+def ask(prompt):
+    hit = cache.get(prompt)
+    if hit is not None:
+        return hit
+    answer = my_llm(prompt)
+    cache.put(prompt, answer)
+    return answer
+```
+
+## How it works
+
+`get` embeds the prompt, takes the top-k nearest stored vectors by cosine
+similarity, drops anything below the threshold, and returns the best surviving
+answer. Vectors are L2-normalized on both the write and query paths, so cosine
+is a plain dot product and the search is one numpy matmul.
+
+Embeddings are stored durably in sqlite as BLOBs; the in-memory index is a
+derived cache of them. That makes restart and compaction trivial — the index is
+always rebuildable from the scalar store.
+
+## API
+
+### `Cache(path=":memory:", embedder=None, dim=None, threshold=0.68, max_size=1000, top_k=5, skip_pattern=ID_PATTERN, max_age=None)`
+
+| Arg | Meaning |
+|---|---|
+| `path` | sqlite file, or `":memory:"` |
+| `embedder` | `Callable[[str], np.ndarray]`; defaults to `all-MiniLM-L6-v2` |
+| `dim` | embedding dimension; inferred if omitted |
+| `threshold` | cosine similarity required for a hit, `[-1, 1]` |
+| `max_size` | live entries before the LRU starts evicting |
+| `top_k` | candidates pulled from the index per query |
+| `skip_pattern` | prompts matching it never consult the cache; `None` disables |
+| `max_age` | seconds before an entry goes stale; `None` means never |
+
+- `get(prompt, threshold=None, session_id=None, max_age=None) -> str | None`
+- `put(prompt, answer, session_id=None) -> int | None`
+- `search(prompt, top_k=None, session_id=None, max_age=None) -> list[(score, question, answer)]` — unfiltered by threshold; the calibration tool
+- `close()` — also runs on `__exit__`
+
+## Calibrate the threshold on your own traffic
+
+The default 0.68 is a starting point, not an answer. Collect real prompt pairs,
+label them same-intent or not, and sweep.
+
+**The asymmetry that should drive the choice:** a false miss costs one API call;
+a false hit returns a **wrong answer to a user**, silently, and you find out from
+a support ticket. Start strict and loosen.
+
+### The limit worth knowing before you deploy
+
+A general-purpose embedder cannot separate some pairs at any threshold:
+
+| Family | Example | Cosine |
+|---|---|---|
+| direction | `convert celsius to fahrenheit` / `...fahrenheit to celsius` | **0.994** |
+| negation | `is python garbage collected` / `is python not garbage collected` | **0.981** |
+| unit | `set the timeout to 30 seconds` / `...30 minutes` | **0.970** |
+
+Each is one token against a near-identical sentence. No threshold fixes this —
+the remedies are a domain embedder or a cross-encoder rerank.
+
+For opaque identifiers (ticket ids, SKUs, versions, status codes) the fix is to
+not look at all, which is what `skip_pattern` does by default:
+
+```python
+ID_PATTERN = re.compile(r"\b([A-Z]{2,}-\d+|\d{3,}|v?\d+\.\d+)\b")
+```
+
+It neutralizes 7 of 31 adversarial pairs for 1 of 29 legitimate hits lost. Pass
+`skip_pattern=None` to disable.
+
+## Sessions
+
+`session_id` isolates tenants. A prompt stored under one is invisible to
+another, filtered before the top-k cut so tenants cannot starve each other:
+
+```python
+cache.put("what is our revenue", "42M", session_id="acme")
+cache.get("what is our revenue", session_id="globex")   # None
+cache.get("what is our revenue", session_id="acme")     # "42M"
+```
+
+## Eviction
+
+Two tiers, because deleting from a vector index is expensive and deleting from
+sqlite is not. The LRU pops the least-recently-used id and the row is marked
+`state = -1`; once marked rows exceed 5000 or 10% of the store, compaction
+hard-deletes them and rebuilds the index. Reads touch the LRU, so recency is
+real, and it survives compaction.
+
+## Performance
+
+50k entries × 768 dims, excluding the embedder:
+
+| Operation | Measured |
+|---|---|
+| `search` p50 | 4.2 ms |
+| `compact()` (10% marked) | 82 ms |
+| startup index load | 0.11 s |
+| `put` amortized | 0.31 ms |
+
+Embedding dominates below ~100k entries (10–30 ms per short prompt on CPU), so
+profile the embedder before optimizing the search. Past ~200k entries, replace
+the body of `Store.search` with faiss or hnswlib; the signature does not change.
+
+## Tests
+
+```bash
+pytest tests/ -q             # 98 unit + invariant tests
+pytest tests/ -q -m slow     # + performance budgets and the real embedder
+python -m tests.golden_pairs # threshold calibration sweep
+```
+
+The suite is mutation-verified: 12 deliberately injected defects, 12 caught.
+
+## Limits
+
+- **Nothing expires unless you set `max_age`.** Cached facts are served forever.
+- **Single writer.** One lock, one sqlite connection — not built for multi-process writes.
+- **Brute-force search.** O(n) scan, fine to ~200k entries.
+- **Capacity is shared across tenants.** Isolation holds, but there is no per-tenant floor.
+
+## License
+
+MIT
