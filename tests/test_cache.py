@@ -59,11 +59,18 @@ def test_per_call_threshold_overrides_instance(cache):
     assert cache.get("q") == "a"           # instance default untouched
 
 
-def test_default_threshold_is_the_gptcache_translation():
-    """faiss L2 <= 0.8 over normalized vectors == cosine >= 0.68."""
-    from semcache.cache import DEFAULT_THRESHOLD
+def test_default_threshold_is_stricter_than_gptcches_actual_behaviour():
+    """The obvious derivation squares 0.8 twice and lands on 0.68.
 
-    assert DEFAULT_THRESHOLD == pytest.approx(1 - 0.8 ** 2 / 2)
+    faiss IndexFlatL2 returns SQUARED L2, so GPTCache's distance bound of 0.8
+    is already on L2^2: 2 - 2cos <= 0.8 gives cos >= 0.60, not 0.68. Confirmed
+    against a live gptcache in tests/test_parity.py.
+    """
+    from semcache.cache import DEFAULT_THRESHOLD, GPTCACHE_EQUIVALENT_THRESHOLD
+
+    assert GPTCACHE_EQUIVALENT_THRESHOLD == pytest.approx(1 - 0.8 / 2)
+    assert DEFAULT_THRESHOLD == pytest.approx(1 - 0.8 ** 2 / 2)   # the wrong one
+    assert DEFAULT_THRESHOLD > GPTCACHE_EQUIVALENT_THRESHOLD, "default must be stricter"
     assert Cache(":memory:", embedder=stub, dim=DIM).threshold == 0.68
 
 

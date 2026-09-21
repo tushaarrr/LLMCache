@@ -16,10 +16,20 @@ import numpy as np
 
 from .store import Store
 
-# GPTCache's default translated. It searches with faiss L2 distance over
-# normalized vectors and accepts distance <= 0.8; for normalized vectors
-# L2^2 = 2 - 2*cos, so 0.8^2 = 2 - 2*cos gives cos = 0.68.
+# A deliberately strict default, NOT a faithful translation of GPTCache's.
+#
+# GPTCache accepts when its faiss distance <= 4.0 * (1 - 0.8) = 0.8. faiss's
+# IndexFlatL2 returns SQUARED L2, so that bound is on L2^2, and for normalized
+# vectors L2^2 = 2 - 2*cos gives cos >= 0.60 -- verified against a live gptcache
+# in tests/test_parity.py, where 0.60 reproduces all 60 of its decisions and
+# 0.68 diverges on 3.
+#
+# 0.68 is what you get by squaring 0.8 a second time. It is kept anyway because
+# it is stricter, and every measurement in this project says false hits are the
+# expensive direction. Use 0.60 if you want GPTCache's behavior rather than a
+# safer one.
 DEFAULT_THRESHOLD = 0.68
+GPTCACHE_EQUIVALENT_THRESHOLD = 0.60
 DEFAULT_MODEL = "all-MiniLM-L6-v2"
 # NOT ms-marco. That model scores query->passage relevance; the question here is
 # "do these two questions want the same answer", which is duplicate-question

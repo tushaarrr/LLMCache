@@ -70,7 +70,7 @@ always rebuildable from the scalar store.
 | `path` | sqlite file, or `":memory:"` |
 | `embedder` | `Callable[[str], np.ndarray]`; defaults to `all-MiniLM-L6-v2` |
 | `dim` | embedding dimension; inferred if omitted |
-| `threshold` | cosine similarity required for a hit, `[-1, 1]` |
+| `threshold` | cosine similarity required for a hit, `[-1, 1]` (default 0.68) |
 | `max_size` | live entries before the LRU starts evicting |
 | `top_k` | candidates pulled from the index per query |
 | `skip_pattern` | prompts matching it never consult the cache; `None` disables |
@@ -119,7 +119,10 @@ holds row ids, never answers.
 
 ## Calibrate the threshold on your own traffic
 
-The default 0.68 is a starting point, not an answer. Collect real prompt pairs,
+The default 0.68 is a starting point, not an answer. It is deliberately strict:
+GPTCache's equivalent default works out to cosine **0.60**, verified by
+reproducing all 61 of its hit/miss decisions in `tests/test_parity.py`. Pass
+`threshold=0.60` if you want its behavior instead of a safer one. Collect real prompt pairs,
 label them same-intent or not, and sweep.
 
 **The asymmetry that should drive the choice:** a false miss costs one API call;
